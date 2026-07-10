@@ -300,9 +300,6 @@ message MemberEntry {
 - **Rebalance**: ~65 keys/sec transfer rate (includes TTL preservation)
 - **Gossip Overhead**: ~1 KB/s per node (1s interval, 3-node fanout)
 
-## License
-
-MIT License - see LICENSE file for details.
 
 ## Contributing
 
@@ -310,4 +307,3 @@ Contributions welcome! Please:
 1. Run `cargo test --workspace` before submitting
 2. Follow existing code style (rustfmt)
 3. Add tests for new features
-4. Update README for user-facing changes
