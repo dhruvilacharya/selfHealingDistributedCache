@@ -1,3 +1,0 @@
-cargo:rerun-if-changed=../../proto/cache.proto
-cargo:rerun-if-changed=../../proto/gossip.proto
-cargo:rerun-if-changed=../../proto/
