@@ -1,0 +1,48 @@
+syntax = "proto3";
+package cache;
+
+service CacheService {
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReplicateWrite(ReplicateRequest) returns (ReplicateResponse);
+  rpc TransferKeys(TransferRequest) returns (stream TransferChunk);
+}
+
+message SetRequest {
+  string key = 1;
+  bytes value = 2;
+  optional uint64 ttl_ms = 3;
+}
+message SetResponse { bool success = 1; }
+
+message GetRequest { string key = 1; }
+message GetResponse {
+  optional bytes value = 1;
+  bool found = 2;
+}
+
+message DeleteRequest { string key = 1; }
+message DeleteResponse { bool deleted = 1; }
+
+message HeartbeatRequest { string node_id = 1; }
+message HeartbeatResponse { bool ok = 1; }
+
+message ReplicateRequest {
+  string key = 1;
+  bytes value = 2;
+  optional uint64 ttl_ms = 3;
+  optional uint64 expires_at_ms = 4; // absolute expiry for transfers
+}
+message ReplicateResponse { bool success = 1; }
+
+message TransferRequest {
+  string target_node_id = 1;
+  repeated string key_prefixes = 2; // key ranges to transfer
+}
+message TransferChunk {
+  string key = 1;
+  bytes value = 2;
+  optional uint64 expires_at_ms = 3;
+}

@@ -1,0 +1,25 @@
+syntax = "proto3";
+package gossip;
+
+service GossipService {
+  rpc GossipExchange(GossipMessage) returns (GossipMessage);
+}
+
+message GossipMessage {
+  repeated MemberEntry members = 1;
+  string sender_id = 2;
+}
+
+message MemberEntry {
+  string node_id = 1;
+  string addr = 2;
+  MemberStatus status = 3;
+  uint64 incarnation = 4;
+  uint64 last_seen_ms = 5;
+}
+
+enum MemberStatus {
+  ALIVE = 0;
+  SUSPECT = 1;
+  DEAD = 2;
+}

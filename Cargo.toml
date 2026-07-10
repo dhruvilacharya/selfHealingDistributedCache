@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/common",
+    "crates/node",
+    "crates/router",
+    "tools/demo",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+dashmap = "6"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+thiserror = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+common = { path = "crates/common" }
