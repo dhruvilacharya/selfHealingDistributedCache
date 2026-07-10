@@ -8,6 +8,7 @@ pub enum MemberStatus {
     Alive,
     Suspect,
     Dead,
+    Joining,
 }
 
 impl std::fmt::Display for MemberStatus {
@@ -16,6 +17,7 @@ impl std::fmt::Display for MemberStatus {
             MemberStatus::Alive => write!(f, "Alive"),
             MemberStatus::Suspect => write!(f, "Suspect"),
             MemberStatus::Dead => write!(f, "Dead"),
+            MemberStatus::Joining => write!(f, "Joining"),
         }
     }
 }
@@ -38,7 +40,9 @@ impl MembershipTable {
         let mut members = HashMap::new();
         let now = Instant::now();
 
-        // Add self as Alive
+        let is_joining = !seed_nodes.is_empty();
+
+        // Add self as Alive (standalone) or Joining (has seeds)
         let self_info = seed_nodes
             .iter()
             .find(|n| n.id == local_id)
@@ -52,7 +56,7 @@ impl MembershipTable {
             local_id.clone(),
             MemberEntry {
                 info: self_info,
-                status: MemberStatus::Alive,
+                status: if is_joining { MemberStatus::Joining } else { MemberStatus::Alive },
                 incarnation: 0,
                 last_seen: now,
             },
@@ -79,8 +83,21 @@ impl MembershipTable {
         }
     }
 
-    /// Get all alive members (excluding self)
+    /// Get all alive members (excluding self) - includes Joining nodes for gossip propagation
     pub fn alive_peers(&self) -> Vec<MemberEntry> {
+        let members = self.members.read().unwrap();
+        members
+            .iter()
+            .filter(|(id, entry)| {
+                **id != self.local_id && 
+                (entry.status == MemberStatus::Alive || entry.status == MemberStatus::Joining)
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect()
+    }
+
+    /// Get only routable peers (Alive, not Joining) for hash ring construction
+    pub fn routable_peers(&self) -> Vec<MemberEntry> {
         let members = self.members.read().unwrap();
         members
             .iter()
@@ -197,9 +214,32 @@ impl MembershipTable {
             .unwrap_or_default()
     }
 
+    /// Mark self as Alive after rebalance completes
+    pub fn mark_self_alive(&self) {
+        let mut members = self.members.write().unwrap();
+        if let Some(entry) = members.get_mut(&self.local_id) {
+            entry.incarnation += 1;
+            entry.status = MemberStatus::Alive;
+            tracing::info!(
+                "Node {} transitioned to Alive (incarnation {})",
+                self.local_id,
+                entry.incarnation
+            );
+        }
+    }
+
+    /// Check if self is currently in Joining state
+    pub fn is_self_joining(&self) -> bool {
+        let members = self.members.read().unwrap();
+        members
+            .get(&self.local_id)
+            .map(|e| e.status == MemberStatus::Joining)
+            .unwrap_or(false)
+    }
+
     /// Merge remote gossip state into local state
     /// Rule: higher incarnation wins; for same incarnation, more recent last_seen wins
-    /// Dead > Suspect > Alive precedence when incarnation is equal
+    /// Dead > Suspect > Alive > Joining precedence when incarnation is equal
     pub fn merge(&self, remote_entries: Vec<(NodeId, String, MemberStatus, u64)>) {
         let mut members = self.members.write().unwrap();
         for (node_id, addr, remote_status, remote_incarnation) in remote_entries {
@@ -239,11 +279,17 @@ impl MembershipTable {
                         },
                     );
                 } else if remote_incarnation == local.incarnation {
-                    // Same incarnation: Dead > Suspect > Alive
+                    // Same incarnation: Dead > Suspect > Alive > Joining
                     let should_update = match (local.status, remote_status) {
-                        (MemberStatus::Alive, MemberStatus::Suspect) => true,
+                        // Dead always wins
                         (MemberStatus::Alive, MemberStatus::Dead) => true,
                         (MemberStatus::Suspect, MemberStatus::Dead) => true,
+                        (MemberStatus::Joining, MemberStatus::Dead) => true,
+                        // Suspect beats Alive and Joining
+                        (MemberStatus::Alive, MemberStatus::Suspect) => true,
+                        (MemberStatus::Joining, MemberStatus::Suspect) => true,
+                        // Alive beats Joining
+                        (MemberStatus::Joining, MemberStatus::Alive) => true,
                         _ => false,
                     };
                     if should_update {
@@ -301,9 +347,10 @@ mod tests {
 
         let table = MembershipTable::new(local_id.clone(), seeds);
 
-        assert!(table.is_alive(&local_id));
+        // Node should start as Joining since seed nodes were provided
+        assert!(table.is_self_joining());
         assert!(table.is_alive(&NodeId::parse("22222222-2222-2222-2222-222222222222").unwrap()));
-        assert_eq!(table.alive_peers().len(), 1);
+        assert_eq!(table.alive_peers().len(), 1);  // peer is Alive, not including self
         assert_eq!(table.all_members().len(), 2);
     }
 
@@ -490,5 +537,139 @@ mod tests {
         // Peer should be suspect now
         assert!(!table2.is_alive(&peer_id2));
         assert_eq!(table2.dead_nodes().len(), 0);
+    }
+
+    #[test]
+    fn test_merge_joining_precedence() {
+        let local_id = NodeId::parse("11111111-1111-1111-1111-111111111111").unwrap();
+        let peer_id = NodeId::parse("22222222-2222-2222-2222-222222222222").unwrap();
+        
+        // Test Alive > Joining
+        let seeds = vec![
+            NodeInfo {
+                id: local_id.clone(),
+                addr: "127.0.0.1:5001".to_string(),
+            },
+        ];
+        let table = MembershipTable::new(local_id.clone(), seeds);
+        
+        // Add peer as Joining
+        table.merge(vec![(
+            peer_id.clone(),
+            "127.0.0.1:5002".to_string(),
+            MemberStatus::Joining,
+            0,
+        )]);
+        
+        // Now remote says Alive at same incarnation
+        table.merge(vec![(
+            peer_id.clone(),
+            "127.0.0.1:5002".to_string(),
+            MemberStatus::Alive,
+            0,
+        )]);
+        
+        assert!(table.is_alive(&peer_id));
+        
+        // Test Dead > Joining
+        let peer_id2 = NodeId::parse("33333333-3333-3333-3333-333333333333").unwrap();
+        table.merge(vec![(
+            peer_id2.clone(),
+            "127.0.0.1:5003".to_string(),
+            MemberStatus::Joining,
+            0,
+        )]);
+        
+        table.merge(vec![(
+            peer_id2.clone(),
+            "127.0.0.1:5003".to_string(),
+            MemberStatus::Dead,
+            0,
+        )]);
+        
+        assert_eq!(table.dead_nodes().len(), 1);
+        
+        // Test Suspect > Joining
+        let peer_id3 = NodeId::parse("44444444-4444-4444-4444-444444444444").unwrap();
+        table.merge(vec![(
+            peer_id3.clone(),
+            "127.0.0.1:5004".to_string(),
+            MemberStatus::Joining,
+            0,
+        )]);
+        
+        table.merge(vec![(
+            peer_id3.clone(),
+            "127.0.0.1:5004".to_string(),
+            MemberStatus::Suspect,
+            0,
+        )]);
+        
+        assert!(!table.is_alive(&peer_id3));
+    }
+
+    #[test]
+    fn test_routable_peers_excludes_joining() {
+        let local_id = NodeId::parse("11111111-1111-1111-1111-111111111111").unwrap();
+        let peer_id1 = NodeId::parse("22222222-2222-2222-2222-222222222222").unwrap();
+        let peer_id2 = NodeId::parse("33333333-3333-3333-3333-333333333333").unwrap();
+        
+        let seeds = vec![
+            NodeInfo {
+                id: local_id.clone(),
+                addr: "127.0.0.1:5001".to_string(),
+            },
+        ];
+        
+        let table = MembershipTable::new(local_id.clone(), seeds);
+        
+        // Add one Alive and one Joining peer
+        table.merge(vec![
+            (peer_id1.clone(), "127.0.0.1:5002".to_string(), MemberStatus::Alive, 0),
+            (peer_id2.clone(), "127.0.0.1:5003".to_string(), MemberStatus::Joining, 0),
+        ]);
+        
+        // alive_peers should include both
+        assert_eq!(table.alive_peers().len(), 2);
+        
+        // routable_peers should only include Alive
+        let routable = table.routable_peers();
+        assert_eq!(routable.len(), 1);
+        assert_eq!(routable[0].info.id, peer_id1);
+    }
+
+    #[test]
+    fn test_joining_node_startup() {
+        let local_id = NodeId::parse("11111111-1111-1111-1111-111111111111").unwrap();
+        let peer_id = NodeId::parse("22222222-2222-2222-2222-222222222222").unwrap();
+        
+        // Node with seed nodes should start as Joining
+        let seeds = vec![
+            NodeInfo {
+                id: peer_id.clone(),
+                addr: "127.0.0.1:5002".to_string(),
+            },
+        ];
+        
+        let table = MembershipTable::new(local_id.clone(), seeds);
+        assert!(table.is_self_joining());
+        
+        // Mark self as alive after rebalance
+        table.mark_self_alive();
+        assert!(!table.is_self_joining());
+        assert!(table.is_alive(&local_id));
+        assert_eq!(table.local_incarnation(), 1); // incarnation bumped
+    }
+
+    #[test]
+    fn test_standalone_node_startup() {
+        let local_id = NodeId::parse("11111111-1111-1111-1111-111111111111").unwrap();
+        
+        // Node with no seeds should start as Alive
+        let seeds = vec![];
+        let table = MembershipTable::new(local_id.clone(), seeds);
+        
+        assert!(!table.is_self_joining());
+        assert!(table.is_alive(&local_id));
     }
 }

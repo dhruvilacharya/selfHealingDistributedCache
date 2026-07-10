@@ -3,9 +3,11 @@ use common::cache_proto::cache_service_client::CacheServiceClient;
 use common::cache_proto::TransferRequest;
 use common::hashring::HashRing;
 use common::{NodeId, NodeInfo};
+use dashmap::DashSet;
 use std::sync::Arc;
 
 use crate::cache::CacheStore;
+use crate::gossip::state::MembershipTable;
 
 /// Handles key rebalancing when this node joins or recovers in the cluster.
 /// Pulls keys from peer nodes via the TransferKeys streaming RPC and inserts
@@ -13,11 +15,93 @@ use crate::cache::CacheStore;
 pub struct Rebalancer {
     store: Arc<CacheStore>,
     local_id: NodeId,
+    membership_table: Arc<MembershipTable>,
+    tombstones: Arc<DashSet<String>>,
 }
 
 impl Rebalancer {
-    pub fn new(store: Arc<CacheStore>, local_id: NodeId) -> Self {
-        Self { store, local_id }
+    pub fn new(
+        store: Arc<CacheStore>,
+        local_id: NodeId,
+        membership_table: Arc<MembershipTable>,
+        tombstones: Arc<DashSet<String>>,
+    ) -> Self {
+        Self {
+            store,
+            local_id,
+            membership_table,
+            tombstones,
+        }
+    }
+
+    /// Wait for gossip convergence and then trigger rebalance.
+    /// Polls membership_table.routable_peers() until at least one real peer is visible.
+    /// Then builds the ring from live gossip membership and runs the transfer loop.
+    pub async fn wait_and_rebalance(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        tracing::info!("Waiting for gossip convergence before starting rebalance...");
+
+        // Poll until we see at least one routable peer
+        loop {
+            let peers = self.membership_table.routable_peers();
+            if !peers.is_empty() {
+                tracing::info!(
+                    "Gossip converged: {} routable peers visible",
+                    peers.len()
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // Build ring from live membership (only routable peers + self)
+        let peers = self.membership_table.routable_peers();
+        let mut ring = HashRing::new();
+        
+        // Add self
+        let local_addr = self.membership_table.local_addr();
+        ring.add_node(NodeInfo {
+            id: self.local_id.clone(),
+            addr: local_addr,
+        });
+        
+        // Add routable peers
+        for peer in &peers {
+            ring.add_node(peer.info.clone());
+        }
+
+        tracing::info!(
+            "Starting rebalance: pulling keys from {} peers",
+            peers.len()
+        );
+
+        // Run the existing rebalance logic
+        let peer_infos: Vec<NodeInfo> = peers.iter().map(|e| e.info.clone()).collect();
+        let count = self.rebalance(&peer_infos, &ring).await?;
+
+        // Apply tombstones to purge any keys deleted during transfer
+        let tombstone_count = self.tombstones.len();
+        if tombstone_count > 0 {
+            tracing::info!(
+                "Applying {} tombstones to prevent resurrection",
+                tombstone_count
+            );
+            for key_ref in self.tombstones.iter() {
+                self.store.delete(key_ref.key());
+            }
+        }
+
+        // Mark self as Alive now that rebalance is complete
+        self.membership_table.mark_self_alive();
+
+        tracing::info!(
+            "Rebalance complete: {} keys transferred, {} tombstones applied",
+            count,
+            tombstone_count
+        );
+
+        Ok(count)
     }
 
     /// Pull keys from a single source node that belong to this node according to `ring`.
@@ -86,17 +170,24 @@ impl Rebalancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gossip::state::MembershipTable;
     use crate::grpc::CacheServiceImpl;
     use common::cache_proto::cache_service_server::CacheServiceServer;
     use common::NodeId;
+    use dashmap::DashSet;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tonic::transport::Server;
 
     /// Spin up a gRPC server on a random free port, returning (addr, store).
     async fn start_test_server() -> (String, Arc<CacheStore>) {
+        use crate::gossip::state::MembershipTable;
+        
         let store = Arc::new(CacheStore::new());
-        let service = CacheServiceImpl::new(Arc::clone(&store));
+        let node_id = NodeId::new();
+        let membership_table = Arc::new(MembershipTable::new(node_id, vec![]));
+        let tombstones = Arc::new(DashSet::new());
+        let service = CacheServiceImpl::new(Arc::clone(&store), membership_table, tombstones);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -142,7 +233,9 @@ mod tests {
         ring.add_node(target_info);
 
         let target_store = Arc::new(CacheStore::new());
-        let rebalancer = Rebalancer::new(target_store.clone(), target_id);
+        let membership_table = Arc::new(MembershipTable::new(target_id.clone(), vec![]));
+        let tombstones = Arc::new(DashSet::new());
+        let rebalancer = Rebalancer::new(target_store.clone(), target_id, membership_table, tombstones);
         let peers = vec![NodeInfo {
             id: source_id.clone(),
             addr: addr.clone(),
@@ -192,7 +285,9 @@ mod tests {
         }
 
         let target_store = Arc::new(CacheStore::new());
-        let rebalancer = Rebalancer::new(target_store.clone(), target_id);
+        let membership_table = Arc::new(MembershipTable::new(target_id.clone(), vec![]));
+        let tombstones = Arc::new(DashSet::new());
+        let rebalancer = Rebalancer::new(target_store.clone(), target_id, membership_table, tombstones);
         let peers = vec![NodeInfo {
             id: source_id,
             addr,

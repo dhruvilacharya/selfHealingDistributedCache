@@ -34,6 +34,7 @@ impl GossipService for GossipServiceImpl {
                     Ok(ProtoMemberStatus::Alive) => MemberStatus::Alive,
                     Ok(ProtoMemberStatus::Suspect) => MemberStatus::Suspect,
                     Ok(ProtoMemberStatus::Dead) => MemberStatus::Dead,
+                    Ok(ProtoMemberStatus::Joining) => MemberStatus::Joining,
                     Err(_) => MemberStatus::Alive,
                 };
                 (

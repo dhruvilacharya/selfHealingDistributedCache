@@ -15,6 +15,7 @@ pub enum NodeHealth {
     Alive,
     Suspect,
     Dead,
+    Joining,
 }
 
 impl std::fmt::Display for NodeHealth {
@@ -23,6 +24,7 @@ impl std::fmt::Display for NodeHealth {
             NodeHealth::Alive => write!(f, "Alive"),
             NodeHealth::Suspect => write!(f, "Suspect"),
             NodeHealth::Dead => write!(f, "Dead"),
+            NodeHealth::Joining => write!(f, "Joining"),
         }
     }
 }
@@ -66,6 +68,19 @@ impl HealthMonitor {
         );
     }
 
+    /// Mark a node as Joining (during rebalance).
+    pub async fn mark_joining(&self, node_id: NodeId) {
+        let mut nodes = self.nodes.write().await;
+        nodes.insert(
+            node_id,
+            NodeHealthEntry {
+                health: NodeHealth::Joining,
+                last_checked: Instant::now(),
+                consecutive_failures: 0,
+            },
+        );
+    }
+
     /// Record a failed heartbeat. Transitions: Alive->Suspect, Suspect->Dead (after threshold).
     pub async fn record_failure(&self, node_id: NodeId) {
         let mut nodes = self.nodes.write().await;
@@ -83,6 +98,14 @@ impl HealthMonitor {
                 entry.health = NodeHealth::Suspect;
                 warn!(
                     "Node {} is now Suspect ({} consecutive failures)",
+                    node_id, entry.consecutive_failures
+                );
+            }
+            NodeHealth::Joining => {
+                // Joining nodes can also fail heartbeats, treat like Alive
+                entry.health = NodeHealth::Suspect;
+                warn!(
+                    "Joining node {} is now Suspect ({} consecutive failures)",
                     node_id, entry.consecutive_failures
                 );
             }
@@ -106,12 +129,13 @@ impl HealthMonitor {
         }
     }
 
-    /// Check whether a node is considered alive (Alive or Suspect, not Dead).
+    /// Check whether a node is considered alive (Alive or Suspect, not Dead or Joining).
     /// Unknown nodes are assumed alive.
+    /// Joining nodes are excluded from routing to prevent writes during rebalance.
     pub async fn is_alive(&self, node_id: &NodeId) -> bool {
         let nodes = self.nodes.read().await;
         match nodes.get(node_id) {
-            Some(entry) => entry.health != NodeHealth::Dead,
+            Some(entry) => entry.health != NodeHealth::Dead && entry.health != NodeHealth::Joining,
             None => true,
         }
     }
@@ -194,4 +218,100 @@ pub async fn start_health_checker(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mark_alive() {
+        let monitor = HealthMonitor::new();
+        let node_id = NodeId::new();
+
+        monitor.mark_alive(node_id.clone()).await;
+        assert!(monitor.is_alive(&node_id).await);
+
+        let health = monitor.all_health().await;
+        assert_eq!(health.get(&node_id), Some(&NodeHealth::Alive));
+    }
+
+    #[tokio::test]
+    async fn test_mark_joining() {
+        let monitor = HealthMonitor::new();
+        let node_id = NodeId::new();
+
+        monitor.mark_joining(node_id.clone()).await;
+        // Joining nodes should NOT be considered alive for routing
+        assert!(!monitor.is_alive(&node_id).await);
+
+        let health = monitor.all_health().await;
+        assert_eq!(health.get(&node_id), Some(&NodeHealth::Joining));
+    }
+
+    #[tokio::test]
+    async fn test_joining_to_alive_transition() {
+        let monitor = HealthMonitor::new();
+        let node_id = NodeId::new();
+
+        // Start as Joining
+        monitor.mark_joining(node_id.clone()).await;
+        assert!(!monitor.is_alive(&node_id).await);
+
+        // Transition to Alive
+        monitor.mark_alive(node_id.clone()).await;
+        assert!(monitor.is_alive(&node_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_record_failure_escalation() {
+        let monitor = HealthMonitor::new().with_failure_threshold(3);
+        let node_id = NodeId::new();
+
+        // Start as Alive
+        monitor.mark_alive(node_id.clone()).await;
+        assert!(monitor.is_alive(&node_id).await);
+
+        // First failure -> Suspect
+        monitor.record_failure(node_id.clone()).await;
+        assert!(monitor.is_alive(&node_id).await); // Suspect is still routable
+        let health = monitor.all_health().await;
+        assert_eq!(health.get(&node_id), Some(&NodeHealth::Suspect));
+
+        // More failures -> Dead after threshold
+        monitor.record_failure(node_id.clone()).await;
+        monitor.record_failure(node_id.clone()).await;
+        assert!(!monitor.is_alive(&node_id).await);
+        let health = monitor.all_health().await;
+        assert_eq!(health.get(&node_id), Some(&NodeHealth::Dead));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_node_assumed_alive() {
+        let monitor = HealthMonitor::new();
+        let unknown_node = NodeId::new();
+
+        // Unknown nodes are assumed alive
+        assert!(monitor.is_alive(&unknown_node).await);
+    }
+
+    #[tokio::test]
+    async fn test_dead_nodes_list() {
+        let monitor = HealthMonitor::new().with_failure_threshold(2);
+        let node1 = NodeId::new();
+        let node2 = NodeId::new();
+
+        monitor.mark_alive(node1.clone()).await;
+        monitor.mark_alive(node2.clone()).await;
+
+        // Kill node1
+        monitor.record_failure(node1.clone()).await;
+        monitor.record_failure(node1.clone()).await;
+        monitor.record_failure(node1.clone()).await;
+
+        let dead = monitor.dead_nodes().await;
+        assert_eq!(dead.len(), 1);
+        assert!(dead.contains(&node1));
+        assert!(!dead.contains(&node2));
+    }
 }

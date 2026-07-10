@@ -2,6 +2,7 @@ use clap::Parser;
 use common::cache_proto::cache_service_server::CacheServiceServer;
 use common::HashRing;
 use router::client::NodeClientPool;
+use router::gossip::RouterGossipClient;
 use router::grpc::RouterServiceImpl;
 use router::health::{start_health_checker, HealthMonitor};
 use router::membership::ClusterConfig;
@@ -77,11 +78,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     start_health_checker(
         Arc::clone(&health_monitor),
-        node_addrs,
+        node_addrs.clone(),
         Arc::clone(&client_pool),
         Duration::from_millis(args.health_check_interval_ms),
     )
     .await;
+
+    // Start gossip client for dynamic membership updates
+    let seed_addrs: Vec<String> = node_addrs.iter().map(|(_, addr)| addr.clone()).collect();
+    let gossip_client = RouterGossipClient::new(
+        Arc::clone(&hash_ring),
+        Arc::clone(&health_monitor),
+        seed_addrs,
+    );
+    tokio::spawn(async move {
+        gossip_client.run().await;
+    });
 
     // Create replication config and coordinator
     let replication_config = ReplicationConfig {

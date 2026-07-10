@@ -1,7 +1,8 @@
 use clap::Parser;
 use common::cache_proto::cache_service_server::CacheServiceServer;
 use common::gossip_proto::gossip_service_server::GossipServiceServer;
-use common::{HashRing, NodeId, NodeInfo};
+use common::NodeId;
+use dashmap::DashSet;
 use node::cache::{start_expiry_sweeper, CacheStore};
 use node::gossip::protocol::GossipProtocol;
 use node::gossip::server::GossipServiceImpl;
@@ -32,10 +33,6 @@ struct Args {
     /// Comma-separated list of seed node addresses (host:port), e.g. "127.0.0.1:5002,127.0.0.1:5003"
     #[arg(long, default_value = "")]
     seed_nodes: String,
-
-    /// Delay in ms before a joining node starts pulling keys for rebalance
-    #[arg(long, default_value = "3000")]
-    join_delay_ms: u64,
 }
 
 #[tokio::main]
@@ -68,18 +65,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .map(|s| s.trim().to_string())
         .collect();
-    let seed_nodes: Vec<NodeInfo> = seed_addrs
+    let seed_nodes: Vec<common::NodeInfo> = seed_addrs
         .iter()
         .map(|addr| {
             // Each seed node needs an addr. Use a synthetic ID since we don't know remote IDs yet.
-            NodeInfo {
+            common::NodeInfo {
                 id: NodeId::new(), // Will be updated on first gossip exchange
                 addr: addr.clone(),
             }
         })
         .collect();
     let is_joining = !seed_nodes.is_empty();
-    let rebalance_peers = seed_nodes.clone(); // keep a copy for rebalancing
 
     let table = Arc::new(MembershipTable::new(node_id.clone(), seed_nodes));
     let gossip = GossipProtocol::new(table.clone(), node_id.clone());
@@ -90,32 +86,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let grpc_addr = args.addr.parse()?;
-    let cache_service = CacheServiceImpl::new(Arc::clone(&store));
+    let tombstones = Arc::new(DashSet::new());
+    let cache_service = CacheServiceImpl::new(Arc::clone(&store), table.clone(), tombstones.clone());
     let gossip_service = GossipServiceImpl::new(table.clone());
 
     let resp_addr = args.resp_addr.clone();
     let resp_store = Arc::clone(&store);
 
-    // If this is a joining node, trigger rebalance after a delay.
+    // If this is a joining node, trigger gossip-triggered rebalance.
     if is_joining {
-        let rebalancer = Rebalancer::new(Arc::clone(&store), node_id.clone());
-        let join_delay = Duration::from_millis(args.join_delay_ms);
-        let local_info = NodeInfo {
-            id: node_id.clone(),
-            addr: args.addr.clone(),
-        };
-        let ring_peers: Vec<NodeInfo> = std::iter::once(local_info)
-            .chain(rebalance_peers.iter().cloned())
-            .collect();
-        let mut ring = HashRing::new();
-        for peer in &ring_peers {
-            ring.add_node(peer.clone());
-        }
-        let peers = rebalance_peers.clone();
+        let rebalancer = Rebalancer::new(
+            Arc::clone(&store),
+            node_id.clone(),
+            table.clone(),
+            tombstones.clone(),
+        );
         tokio::spawn(async move {
-            tokio::time::sleep(join_delay).await;
-            info!("Starting rebalance: pulling keys from {} peers", peers.len());
-            match rebalancer.rebalance(&peers, &ring).await {
+            match rebalancer.wait_and_rebalance().await {
                 Ok(count) => info!("Rebalance complete: {} keys transferred", count),
                 Err(e) => tracing::error!("Rebalance failed: {}", e),
             }

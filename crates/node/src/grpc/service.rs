@@ -1,10 +1,12 @@
 use crate::cache::CacheStore;
+use crate::gossip::state::MembershipTable;
 use bytes::Bytes;
 use common::cache_proto::cache_service_server::CacheService;
 use common::cache_proto::{
     DeleteRequest, DeleteResponse, GetRequest, GetResponse, HeartbeatRequest, HeartbeatResponse,
     ReplicateRequest, ReplicateResponse, SetRequest, SetResponse, TransferChunk, TransferRequest,
 };
+use dashmap::DashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
@@ -12,17 +14,30 @@ use tonic::{Request, Response, Status};
 
 pub struct CacheServiceImpl {
     store: Arc<CacheStore>,
+    membership_table: Arc<MembershipTable>,
+    tombstones: Arc<DashSet<String>>,
 }
 
 impl CacheServiceImpl {
-    pub fn new(store: Arc<CacheStore>) -> Self {
-        Self { store }
+    pub fn new(
+        store: Arc<CacheStore>,
+        membership_table: Arc<MembershipTable>,
+        tombstones: Arc<DashSet<String>>,
+    ) -> Self {
+        Self {
+            store,
+            membership_table,
+            tombstones,
+        }
     }
 }
 
 #[tonic::async_trait]
 impl CacheService for CacheServiceImpl {
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
+        if self.membership_table.is_self_joining() {
+            return Err(Status::unavailable("node is joining"));
+        }
         let req = request.into_inner();
         let ttl = req.ttl_ms.map(Duration::from_millis);
         self.store.set(req.key, Bytes::from(req.value), ttl);
@@ -48,6 +63,15 @@ impl CacheService for CacheServiceImpl {
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let req = request.into_inner();
+        
+        // If we're joining, track deletes in tombstone set to prevent resurrection
+        // but still reject the operation from the client's perspective
+        if self.membership_table.is_self_joining() {
+            self.tombstones.insert(req.key.clone());
+            self.store.delete(&req.key);
+            return Err(Status::unavailable("node is joining"));
+        }
+        
         let deleted = self.store.delete(&req.key);
         Ok(Response::new(DeleteResponse { deleted }))
     }

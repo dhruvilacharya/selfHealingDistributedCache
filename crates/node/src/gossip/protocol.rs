@@ -82,6 +82,17 @@ impl GossipProtocol {
                         self.table.mark_suspect(&member.info.id);
                     }
                 }
+                MemberStatus::Joining => {
+                    // Joining nodes also get monitored for heartbeats
+                    if elapsed > SUSPECT_TIMEOUT {
+                        tracing::warn!(
+                            "Joining node {} suspected (no response for {:.1}s)",
+                            member.info.id,
+                            elapsed.as_secs_f64()
+                        );
+                        self.table.mark_suspect(&member.info.id);
+                    }
+                }
                 MemberStatus::Suspect => {
                     if elapsed > DEAD_TIMEOUT {
                         tracing::error!(
@@ -114,6 +125,7 @@ impl GossipProtocol {
                     Ok(ProtoMemberStatus::Alive) => MemberStatus::Alive,
                     Ok(ProtoMemberStatus::Suspect) => MemberStatus::Suspect,
                     Ok(ProtoMemberStatus::Dead) => MemberStatus::Dead,
+                    Ok(ProtoMemberStatus::Joining) => MemberStatus::Joining,
                     Err(_) => MemberStatus::Alive,
                 };
                 (
@@ -155,6 +167,7 @@ pub fn build_gossip_message(table: &MembershipTable) -> GossipMessage {
                 MemberStatus::Alive => ProtoMemberStatus::Alive as i32,
                 MemberStatus::Suspect => ProtoMemberStatus::Suspect as i32,
                 MemberStatus::Dead => ProtoMemberStatus::Dead as i32,
+                MemberStatus::Joining => ProtoMemberStatus::Joining as i32,
             },
             incarnation: entry.incarnation,
             last_seen_ms: entry.last_seen.elapsed().as_millis() as u64,

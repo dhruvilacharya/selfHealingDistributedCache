@@ -22,4 +22,5 @@ enum MemberStatus {
   ALIVE = 0;
   SUSPECT = 1;
   DEAD = 2;
+  JOINING = 3;
 }
